@@ -164,9 +164,8 @@ fn binary_exists(binary: &str) -> bool {
         return std::path::Path::new(binary).exists();
     }
 
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
 }
 
 fn spawn_geckodriver(port: &str) -> Result<Child, Box<dyn Error>> {
@@ -231,7 +230,10 @@ async fn connect(port: &str, binary: &str, profile_dir: &str) -> Result<Client, 
     );
 
     let mut capabilities = Map::new();
-    capabilities.insert("moz:firefoxOptions".to_string(), Json::Object(firefox_options));
+    capabilities.insert(
+        "moz:firefoxOptions".to_string(),
+        Json::Object(firefox_options),
+    );
 
     let mut builder = ClientBuilder::new(HttpConnector::new());
     builder.capabilities(capabilities);
@@ -243,7 +245,9 @@ async fn connect(port: &str, binary: &str, profile_dir: &str) -> Result<Client, 
             Ok(client) => return Ok(client),
             Err(e) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(format!("couldn't connect to geckodriver at {webdriver_url}: {e}").into());
+                    return Err(
+                        format!("couldn't connect to geckodriver at {webdriver_url}: {e}").into(),
+                    );
                 }
                 sleep(GECKODRIVER_CONNECT_RETRY_INTERVAL).await;
             }
@@ -324,14 +328,22 @@ async fn try_click_next_button(client: &Client, yolo_mode: bool) -> Step {
             };
         }
 
-        let class_attr = last_block.attr("class").await.ok().flatten().unwrap_or_default();
+        let class_attr = last_block
+            .attr("class")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
 
         return match class_attr
             .split_whitespace()
             .find_map(|c| c.strip_prefix("theory-viewer__block_type_"))
         {
             Some("action-button") => {
-                match last_block.find(Locator::Css(CONTENT_EXPANDER_SELECTOR)).await {
+                match last_block
+                    .find(Locator::Css(CONTENT_EXPANDER_SELECTOR))
+                    .await
+                {
                     Ok(button) if button.click().await.is_ok() => {
                         Step::Clicked(CONTENT_EXPANDER_SELECTOR.to_string())
                     }
@@ -372,7 +384,10 @@ async fn try_yolo_quiz(block: &Element) -> Step {
         }
     }
 
-    let Ok(options) = block.find_all(Locator::Css(QUIZ_OPTION_LABEL_SELECTOR)).await else {
+    let Ok(options) = block
+        .find_all(Locator::Css(QUIZ_OPTION_LABEL_SELECTOR))
+        .await
+    else {
         return Step::Idle;
     };
     if options.is_empty() {
@@ -381,7 +396,11 @@ async fn try_yolo_quiz(block: &Element) -> Step {
 
     let index = rand::random_range(..options.len());
     if options[index].click().await.is_ok() {
-        Step::Clicked(format!("yolo: picked random quiz option {}/{}", index + 1, options.len()))
+        Step::Clicked(format!(
+            "yolo: picked random quiz option {}/{}",
+            index + 1,
+            options.len()
+        ))
     } else {
         Step::Idle
     }
