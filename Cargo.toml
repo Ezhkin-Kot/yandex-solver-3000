@@ -1,0 +1,12 @@
+[package]
+name = "yandex-solver-3000"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15.7"
+fantoccini = { version = "0.22.1", default-features = false }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+rand = "0.10.3"
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
