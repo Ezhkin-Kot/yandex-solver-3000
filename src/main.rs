@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use fantoccini::elements::Element;
+use fantoccini::error::NewSessionError;
 use fantoccini::{Client, ClientBuilder, Locator};
 use hyper_util::client::legacy::connect::HttpConnector;
 use serde_json::{Map, Value as Json};
@@ -168,6 +169,29 @@ fn binary_exists(binary: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
 }
 
+/// Sends SIGTERM (not SIGKILL — gives the browser a chance to shut down
+/// normally and flush its profile) to any process whose command line
+/// contains `profile_dir`. Matching on the profile path rather than a
+/// process name means this can only ever hit a process that was launched
+/// with `-profile <profile_dir>` — i.e. an instance of *this bot's own*
+/// dedicated profile, never the user's regular browser session, which
+/// runs against a different profile path entirely.
+fn kill_stale_browser_process(profile_dir: &str) {
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", profile_dir])
+        .status();
+}
+
+/// Belt-and-suspenders alongside `kill_stale_browser_process`: even once
+/// the process is gone, Gecko's profile-lock artifacts
+/// (`lock`/`.parentlock`) can occasionally outlive it. Removing files that
+/// don't exist is a no-op, so this is safe to call unconditionally.
+fn clear_stale_profile_lock(profile_dir: &str) {
+    for name in ["lock", ".parentlock"] {
+        let _ = std::fs::remove_file(std::path::Path::new(profile_dir).join(name));
+    }
+}
+
 fn spawn_geckodriver(port: &str) -> Result<Child, Box<dyn Error>> {
     Command::new("geckodriver")
         .arg("--port")
@@ -188,7 +212,33 @@ async fn run(
     profile_dir: &str,
     yolo_mode: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = connect(port, binary, profile_dir).await?;
+    let client = match connect(port, binary, profile_dir).await {
+        Ok(client) => client,
+        Err(first_err) => {
+            // A previous run that didn't shut down cleanly (crash, `kill
+            // -9`, a closed terminal, ...) can leave the browser process —
+            // or just its profile lock file — behind: our own cleanup on
+            // exit only reaches the geckodriver process, not the browser
+            // it spawns as its own child. That shows up here as a failed
+            // connection (the browser refuses to start, showing its own
+            // "already running" dialog). We only ever retry once, and
+            // only after failing normally first — never preemptively —
+            // and only against `profile_dir`, which is dedicated to this
+            // bot and never the user's real browser profile.
+            eprintln!(
+                "Couldn't start {}: {first_err}\n\
+                 This usually means a previous run left its browser process (or just its \
+                 profile lock) behind. Closing whatever is using {profile_dir} and retrying \
+                 once — this only ever touches the bot's own dedicated profile, never your \
+                 regular browser session.",
+                browser.label()
+            );
+            kill_stale_browser_process(profile_dir);
+            sleep(Duration::from_millis(500)).await;
+            clear_stale_profile_lock(profile_dir);
+            connect(port, binary, profile_dir).await?
+        }
+    };
     let label = browser.label();
     println!("Connected — {label} window is up.");
     if yolo_mode {
@@ -218,6 +268,17 @@ async fn run(
 
 /// geckodriver's HTTP server takes a moment to come up after we spawn it,
 /// so retry the initial connection instead of failing on the first miss.
+///
+/// Only retries on a *transport*-level failure (`Failed`/`FailedC`/`Lost`
+/// — nothing answering on the port yet), which has no side effect and is
+/// safe to hammer every `GECKODRIVER_CONNECT_RETRY_INTERVAL`. Any other
+/// error means geckodriver's server *did* respond — i.e. it already
+/// tried (and failed) to create a session, which means actually launching
+/// a browser process. Retrying that in the same tight loop would mean up
+/// to ~50 browser-launch attempts in `GECKODRIVER_CONNECT_TIMEOUT`, each
+/// potentially popping its own window — so those are returned immediately
+/// instead, leaving retry decisions to the caller (see the single,
+/// deliberate retry in `run`, which cleans up first).
 async fn connect(port: &str, binary: &str, profile_dir: &str) -> Result<Client, Box<dyn Error>> {
     let mut firefox_options = Map::new();
     firefox_options.insert("binary".to_string(), Json::String(binary.to_string()));
@@ -243,13 +304,22 @@ async fn connect(port: &str, binary: &str, profile_dir: &str) -> Result<Client, 
     loop {
         match builder.connect(&webdriver_url).await {
             Ok(client) => return Ok(client),
-            Err(e) => {
+            Err(
+                e @ (NewSessionError::Failed(_)
+                | NewSessionError::FailedC(_)
+                | NewSessionError::Lost(_)),
+            ) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(
                         format!("couldn't connect to geckodriver at {webdriver_url}: {e}").into(),
                     );
                 }
                 sleep(GECKODRIVER_CONNECT_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(
+                    format!("couldn't connect to geckodriver at {webdriver_url}: {e}").into(),
+                );
             }
         }
     }
