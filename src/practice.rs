@@ -39,6 +39,20 @@ use crate::ollama;
 const CHECK_TASK_BUTTON_SELECTOR: &str = "[data-test-id='check-task-button']";
 const TASK_DESCRIPTION_SELECTOR: &str = ".task-description";
 
+/// After an in-app (SPA) navigation to the next task, the check button and
+/// hint button mount immediately, but the task's own text is fetched
+/// asynchronously and `.task-description` sits empty for a bit —
+/// confirmed live sitting empty for well over `POST_CLICK_SETTLE_DELAY`
+/// (1s) after a real "Продолжить"-style click. Reading task text, the
+/// hint, or files on a fixed timer instead of this signal risks acting on
+/// a still-loading (or, worse, still the *previous* task's) page —
+/// confirmed live getting the previous task's hint text verbatim this way,
+/// which fed the solver a wrong requirement it then couldn't pass no
+/// matter how many attempts. `wait_for_task_description` blocks the whole
+/// solve attempt on this becoming non-empty first.
+const TASK_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const TASK_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Some lessons show their theory content as a popup layered *on top of*
 /// the practice-task page (confirmed live — same URL has both
 /// `[data-test-id="check-task-button"]` and `theory-viewer__block_type_*`
@@ -100,6 +114,32 @@ pub async fn theory_popup_open(client: &Client) -> bool {
         .is_ok()
 }
 
+/// Outcome of a single click-check-and-wait cycle, folding in the two ways
+/// the click itself can fail alongside `CheckOutcome` — lets every call
+/// site (the free pre-check below and the real attempt loop) handle all
+/// four outcomes uniformly instead of duplicating the click/dismiss
+/// boilerplate.
+enum CheckAttempt {
+    Result(CheckOutcome),
+    ButtonMissing,
+    ClickFailed,
+}
+
+/// Dismisses any leftover notification, clicks the check button, and waits
+/// for a result.
+async fn click_check_and_wait(client: &Client) -> CheckAttempt {
+    dismiss_notification(client).await;
+
+    let Ok(check_button) = client.find(Locator::Css(CHECK_TASK_BUTTON_SELECTOR)).await else {
+        return CheckAttempt::ButtonMissing;
+    };
+    if check_button.click().await.is_err() {
+        return CheckAttempt::ClickFailed;
+    }
+    println!("Clicked check, waiting for a result...");
+    CheckAttempt::Result(wait_for_result(client).await)
+}
+
 /// Runs the whole solve-submit-check loop for the practice task currently
 /// on screen, up to `config.max_attempts` times, logging every step. Unlike
 /// the rest of the polling loop (one small DOM step per poll tick), this
@@ -110,16 +150,50 @@ pub async fn theory_popup_open(client: &Client) -> bool {
 pub async fn try_solve(client: &Client, config: &PracticeConfig) {
     println!("Practice task detected — extracting task and files...");
 
-    let task = match client.find(Locator::Css(TASK_DESCRIPTION_SELECTOR)).await {
-        Ok(el) => match el.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("Couldn't read task description: {e}");
-                return;
-            }
-        },
-        Err(e) => {
-            eprintln!("Couldn't find task description: {e}");
+    let task = match wait_for_task_description(client).await {
+        Some(text) => text,
+        None => {
+            eprintln!(
+                "Task description stayed empty for {}s after navigating here — stopping \
+                 rather than solving against stale or missing content.",
+                TASK_READY_TIMEOUT.as_secs()
+            );
+            return;
+        }
+    };
+
+    // Some tasks (confirmed live: an end-of-topic checkpoint whose text
+    // said outright "there's nothing to do here, just move on") already
+    // pass with their starter content untouched. Rather than recognizing
+    // that from the task's wording — brittle, since the exact phrasing
+    // isn't guaranteed to repeat — just try the check as-is first, for
+    // every task: it's the same signal the site itself uses to decide
+    // pass/fail, so it can't be fooled by phrasing, and it's also a
+    // freebie whenever the model would otherwise get a task right on the
+    // first try anyway. Only downside is one extra check-click's worth of
+    // latency on tasks that do need solving, which the site itself
+    // usually resolves in well under `RESULT_POLL_TIMEOUT`.
+    println!("Trying the check as-is first, in case this task needs no changes...");
+    let mut previous_error: Option<String> = match click_check_and_wait(client).await {
+        CheckAttempt::Result(CheckOutcome::Success) => {
+            println!("Practice task passed without any changes.");
+            return;
+        }
+        CheckAttempt::Result(CheckOutcome::Failure(error_text)) => Some(error_text),
+        CheckAttempt::Result(CheckOutcome::Unknown) => {
+            eprintln!(
+                "No result notification appeared within {}s — stopping rather than guessing \
+                 whether this passed.",
+                RESULT_POLL_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        CheckAttempt::ButtonMissing => {
+            eprintln!("Check button disappeared — stopping.");
+            return;
+        }
+        CheckAttempt::ClickFailed => {
+            eprintln!("Couldn't click the check button — stopping.");
             return;
         }
     };
@@ -140,8 +214,6 @@ pub async fn try_solve(client: &Client, config: &PracticeConfig) {
             return;
         }
     };
-
-    let mut previous_error: Option<String> = None;
 
     for attempt in 1..=config.max_attempts {
         println!(
@@ -181,37 +253,29 @@ pub async fn try_solve(client: &Client, config: &PracticeConfig) {
             }
         }
 
-        // A result notification from a previous attempt could otherwise
-        // still be sitting on screen when we start polling for this
-        // attempt's result, and get misread as this attempt's outcome
-        // before the site has actually reacted to the new check.
-        dismiss_notification(client).await;
-
-        let Ok(check_button) = client.find(Locator::Css(CHECK_TASK_BUTTON_SELECTOR)).await else {
-            eprintln!("Check button disappeared — stopping.");
-            return;
-        };
-        if check_button.click().await.is_err() {
-            eprintln!("Couldn't click the check button — stopping.");
-            return;
-        }
-        println!("Clicked check, waiting for a result...");
-
-        match wait_for_result(client).await {
-            CheckOutcome::Success => {
+        match click_check_and_wait(client).await {
+            CheckAttempt::Result(CheckOutcome::Success) => {
                 println!("Practice task passed.");
                 return;
             }
-            CheckOutcome::Failure(error_text) => {
+            CheckAttempt::Result(CheckOutcome::Failure(error_text)) => {
                 println!("Attempt {attempt} failed: {error_text}");
                 previous_error = Some(error_text);
             }
-            CheckOutcome::Unknown => {
+            CheckAttempt::Result(CheckOutcome::Unknown) => {
                 eprintln!(
                     "No result notification appeared within {}s — stopping rather than \
                      guessing whether this passed.",
                     RESULT_POLL_TIMEOUT.as_secs()
                 );
+                return;
+            }
+            CheckAttempt::ButtonMissing => {
+                eprintln!("Check button disappeared — stopping.");
+                return;
+            }
+            CheckAttempt::ClickFailed => {
+                eprintln!("Couldn't click the check button — stopping.");
                 return;
             }
         }
@@ -221,6 +285,25 @@ pub async fn try_solve(client: &Client, config: &PracticeConfig) {
         "Giving up after {} attempts — leaving this task for you to solve manually.",
         config.max_attempts
     );
+}
+
+/// Polls `.task-description` until it has non-empty text, up to
+/// `TASK_READY_TIMEOUT` — see its doc comment for why a fixed delay isn't
+/// enough. Returns `None` if it never populates in time.
+async fn wait_for_task_description(client: &Client) -> Option<String> {
+    let deadline = std::time::Instant::now() + TASK_READY_TIMEOUT;
+    loop {
+        if let Ok(el) = client.find(Locator::Css(TASK_DESCRIPTION_SELECTOR)).await
+            && let Ok(text) = el.text().await
+            && !text.trim().is_empty()
+        {
+            return Some(text);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        sleep(TASK_READY_POLL_INTERVAL).await;
+    }
 }
 
 /// Opens the task's hint (if it has one) and returns its text. Best-effort
@@ -361,6 +444,28 @@ async fn wait_for_visible(element: &Element) -> bool {
     }
 }
 
+/// Monaco's own auto-closing-bracket/quote and auto-indent-on-Enter
+/// features are meant for a human typing character by character, not for
+/// pasting in an already fully-formed, already-indented multi-line
+/// solution — confirmed live: typing content like `let x = [\n  'a',\n
+/// 'b',\n];` as real keystrokes left a stray extra `]` at the very end
+/// (the bracket Monaco auto-inserted the instant `[` was typed, then
+/// pushed further down by every subsequent newline instead of being
+/// reused) plus compounding indentation on every line. Disabling these
+/// options is a pure editor-behavior setting, not a content mutation, so
+/// it doesn't touch the "must be a real keystroke event, not
+/// `setValue()`" requirement above — `send_keys` below still does the
+/// actual writing. Applied to every editor instance on the page (there's
+/// one per open file tab) since it's harmless on ones we're not currently
+/// writing to.
+const DISABLE_AUTO_PAIRING_SCRIPT: &str = "\
+    monaco.editor.getEditors().forEach(e => e.updateOptions({\
+        autoClosingBrackets: 'never',\
+        autoClosingQuotes: 'never',\
+        autoSurround: 'never',\
+        autoIndent: 'none'\
+    }));";
+
 /// Replaces a file's content by focusing its editor and typing real
 /// keystrokes — see the module doc comment for why this can't be a
 /// `model.setValue()` call. Returns whether a matching editor was found.
@@ -384,6 +489,8 @@ async fn write_file(client: &Client, filename: &str, content: &str) -> Result<bo
     if view_lines.click().await.is_err() {
         return Ok(false);
     }
+
+    let _ = client.execute(DISABLE_AUTO_PAIRING_SCRIPT, Vec::new()).await;
 
     let Ok(input) = client.find(Locator::Css(&input_selector)).await else {
         return Ok(false);
@@ -457,7 +564,12 @@ fn build_prompt(
         "Ты решаешь практическое задание на образовательной платформе для веб-разработки.\n\n\
          Пиши минимально необходимый код, который точно выполняет условие — без лишних \
          промежуточных переменных, преобразований или форматирования вывода, которых условие \
-         не требует явно. Проверка обычно ищет конкретный результат, а не «красивое» решение.\n\n",
+         не требует явно. Проверка обычно ищет конкретный результат, а не «красивое» решение.\n\n\
+         Текущее содержимое файлов ниже уже отражает правильно решённые предыдущие шаги этого же \
+         задания — не переписывай, не удаляй и не заменяй уже существующие строки (например, не \
+         меняй начальное значение переменной и не превращай существующие выражения в другие, даже \
+         эквивалентные по смыслу). Если условие не требует явно изменить существующую строку — \
+         просто допиши недостающий код в конец, оставив всё остальное точно как было.\n\n",
     );
     prompt.push_str("Условие задания:\n");
     prompt.push_str(task);
@@ -491,6 +603,28 @@ fn build_prompt(
     prompt
 }
 
+/// Splits a line like "```FILE: script.js" (confirmed live from
+/// `qwen2.5-coder:3b`: the opening fence glued directly onto the `FILE:`
+/// marker instead of sitting on its own line) into two proper lines —
+/// `FILE: script.js` followed by a fresh opening fence — so the rest of
+/// `parse_solution`/`extract_fenced_code` sees the same shape it always
+/// expects, instead of needing a separate parsing path for this quirk.
+fn normalize_glued_fence_file_markers(response: &str) -> String {
+    let mut out = String::with_capacity(response.len() + 8);
+    for line in response.lines() {
+        if let Some(name) = line.trim_start().strip_prefix("```").and_then(|rest| rest.strip_prefix("FILE:")) {
+            out.push_str("FILE:");
+            out.push_str(name);
+            out.push('\n');
+            out.push_str("```\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Parses the model's response for `FILE: <name>` markers each followed by
 /// a fenced code block, matching the format requested in `build_prompt`.
 /// Tolerates a quirk confirmed live with `qwen2.5-coder:3b` — across
@@ -499,6 +633,7 @@ fn build_prompt(
 /// by not assuming the first fence pair found is the real one (see
 /// `extract_fenced_code`).
 fn parse_solution(response: &str) -> Vec<(String, String)> {
+    let response = normalize_glued_fence_file_markers(response);
     let lines: Vec<&str> = response.lines().collect();
     let mut files = Vec::new();
 
@@ -623,6 +758,15 @@ mod tests {
             ("script.js".to_string(), String::new()),
         ];
         assert!(guess_single_file_solution(response, &files).is_empty());
+    }
+
+    #[test]
+    fn recovers_from_fence_glued_directly_to_file_marker() {
+        // Captured live from qwen2.5-coder:3b: "```FILE: script.js" on one
+        // line instead of "```" and "FILE: script.js" on separate lines.
+        let response = "```FILE: script.js\nlet time = 0;\n```";
+        let files = parse_solution(response);
+        assert_eq!(files, vec![("script.js".to_string(), "let time = 0;".to_string())]);
     }
 
     #[test]
