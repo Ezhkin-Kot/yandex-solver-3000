@@ -215,14 +215,35 @@ pub async fn try_solve(client: &Client, config: &PracticeConfig) {
         }
     };
 
+    // Confirmed live: at `BASE_TEMPERATURE`'s near-greedy sampling, the
+    // model can reproduce the exact same (wrong) response across several
+    // attempts in a row even though the corrective feedback in the prompt
+    // was genuinely different each time (our own local correction, then
+    // two different real site error messages) — a deterministic local
+    // optimum, not a considered best answer. Once that's detected (the raw
+    // response text is byte-identical to the previous attempt's),
+    // remaining attempts switch to `STUCK_TEMPERATURE` so the model has an
+    // actual chance at a different completion, instead of certainly
+    // repeating the same failing one for every attempt left.
+    const BASE_TEMPERATURE: f32 = 0.2;
+    const STUCK_TEMPERATURE: f32 = 0.6;
+    let mut temperature = BASE_TEMPERATURE;
+    let mut last_response: Option<String> = None;
+
     for attempt in 1..=config.max_attempts {
         println!(
             "Attempt {attempt}/{}: asking {} for a solution...",
             config.max_attempts, config.model
         );
 
-        let prompt = build_prompt(&task, hint.as_deref(), &files, previous_error.as_deref());
-        let response = match ollama::complete(&config.model, &prompt).await {
+        let prompt = build_prompt(
+            &task,
+            hint.as_deref(),
+            &files,
+            previous_error.as_deref(),
+            last_response.as_deref(),
+        );
+        let response = match ollama::complete(&config.model, &prompt, temperature).await {
             Ok(text) => text,
             Err(e) => {
                 eprintln!("Solver call failed: {e}");
@@ -230,6 +251,15 @@ pub async fn try_solve(client: &Client, config: &PracticeConfig) {
             }
         };
         println!("--- model response ---\n{response}\n--- end response ---");
+
+        if last_response.as_deref() == Some(response.as_str()) {
+            eprintln!(
+                "Attempt {attempt}: model repeated its previous answer verbatim despite \
+                 different feedback — raising sampling temperature for the remaining attempts."
+            );
+            temperature = STUCK_TEMPERATURE;
+        }
+        last_response = Some(response.clone());
 
         let mut solution = parse_solution(&response);
         if solution.is_empty() {
@@ -558,6 +588,7 @@ fn build_prompt(
     hint: Option<&str>,
     files: &[(String, String)],
     previous_error: Option<&str>,
+    previous_response: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -590,6 +621,15 @@ fn build_prompt(
         prompt.push_str("Предыдущая попытка не прошла проверку. Текст ошибки:\n");
         prompt.push_str(error);
         prompt.push_str("\n\n");
+        if let Some(prev_response) = previous_response {
+            prompt.push_str(
+                "Вот твой предыдущий ответ целиком, который и привёл к этой ошибке — НЕ \
+                 повторяй его снова в том же виде, предложи другой вариант, который её \
+                 устраняет:\n",
+            );
+            prompt.push_str(prev_response);
+            prompt.push_str("\n\n");
+        }
     }
     prompt.push_str(
         "Верни только те файлы, которые нужно изменить, в точности в следующем формате, \
@@ -785,7 +825,7 @@ mod tests {
     #[test]
     fn build_prompt_includes_hint_when_present() {
         let files = vec![("script.js".to_string(), String::new())];
-        let prompt = build_prompt("Условие.", Some("Используй console.log."), &files, None);
+        let prompt = build_prompt("Условие.", Some("Используй console.log."), &files, None, None);
         assert!(prompt.contains("Подсказка"));
         assert!(prompt.contains("Используй console.log."));
     }
@@ -793,7 +833,31 @@ mod tests {
     #[test]
     fn build_prompt_omits_hint_section_when_absent() {
         let files = vec![("script.js".to_string(), String::new())];
-        let prompt = build_prompt("Условие.", None, &files, None);
+        let prompt = build_prompt("Условие.", None, &files, None, None);
         assert!(!prompt.contains("Подсказка"));
+    }
+
+    #[test]
+    fn build_prompt_includes_previous_response_alongside_error() {
+        let files = vec![("script.js".to_string(), String::new())];
+        let prompt = build_prompt(
+            "Условие.",
+            None,
+            &files,
+            Some("Неверное значение переменной time."),
+            Some("FILE: script.js\n```\nlet time = 0;\n```"),
+        );
+        assert!(prompt.contains("НЕ повторяй его"));
+        assert!(prompt.contains("let time = 0;"));
+    }
+
+    #[test]
+    fn build_prompt_omits_previous_response_without_an_error() {
+        let files = vec![("script.js".to_string(), String::new())];
+        // No `previous_error` means this is attempt 1 — nothing to avoid
+        // repeating yet, so `previous_response` (which would only be set
+        // from a prior attempt) shouldn't surface even if passed.
+        let prompt = build_prompt("Условие.", None, &files, None, Some("some earlier text"));
+        assert!(!prompt.contains("some earlier text"));
     }
 }

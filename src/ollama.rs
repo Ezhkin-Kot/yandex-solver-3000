@@ -74,19 +74,18 @@ pub async fn stop(mut child: Child) {
     let _ = child.kill().await;
 }
 
-/// Low temperature on purpose: these prompts ask for one specific, narrow
-/// piece of code (often with an exact expression already spelled out in a
-/// hint), not open-ended writing — confirmed live that the default
-/// (higher) sampling temperature made `qwen2.5-coder:3b` "elaborate" with
-/// unrequested intermediate variables and formatting even when the hint
-/// gave the literal expression to use, failing the check every time. A
-/// low temperature biases the model toward the most direct completion
-/// instead.
-const TEMPERATURE: f32 = 0.2;
-
-/// Sends `prompt` to a local Ollama server and returns the model's
-/// response text.
-pub async fn complete(model: &str, prompt: &str) -> Result<String, Box<dyn Error>> {
+/// Sends `prompt` to a local Ollama server at the given sampling
+/// `temperature` and returns the model's response text. Low by default —
+/// these prompts ask for one specific, narrow piece of code (often with an
+/// exact expression already spelled out in a hint), not open-ended writing
+/// — confirmed live that the default (higher) sampling temperature made
+/// `qwen2.5-coder:3b` "elaborate" with unrequested intermediate variables
+/// and formatting even when the hint gave the literal expression to use,
+/// failing the check every time. `temperature` is caller-controlled rather
+/// than a fixed constant so `practice::try_solve` can raise it when the
+/// model turns out to be repeating the exact same (wrong) answer despite
+/// different corrective feedback each time — see its `STUCK_TEMPERATURE`.
+pub async fn complete(model: &str, prompt: &str, temperature: f32) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{OLLAMA_BASE_URL}/api/generate"))
@@ -95,7 +94,7 @@ pub async fn complete(model: &str, prompt: &str) -> Result<String, Box<dyn Error
             "prompt": prompt,
             "stream": false,
             "options": {
-                "temperature": TEMPERATURE,
+                "temperature": temperature,
             },
         }))
         .send()
